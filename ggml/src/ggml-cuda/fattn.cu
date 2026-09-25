@@ -687,6 +687,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+void ggml_cuda_fattn_log_inkernel_dequant_once(const int32_t code) {
+    static bool logged = false;
+    if (logged || code == GGML_CUDA_FATTN_KV_DEQUANT_OFF) {
+        return;
+    }
+    logged = true;
+    const char * type = code == GGML_CUDA_FATTN_KV_DEQUANT_Q8_0 ? "q8_0" : "q4_0";
+    GGML_LOG_INFO("%s: GGML_CUDA_FA_INKERNEL_DEQUANT on: %s K/V stays quantized; dequant is in the MMA kernel\n", __func__, type);
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -704,10 +714,17 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            // Shared predicate with ggml_cuda_flash_attn_ext_mma_f16_case: when the in-kernel
+            // K/V dequant applies to this dst, no f16 K/V scratch is reserved (and launch_fattn
+            // will skip the to_fp16 conversion for the same reason).
+            const bool inkernel_dequant = ggml_cuda_fattn_kv_dequant_code(dst) != GGML_CUDA_FATTN_KV_DEQUANT_OFF;
+            need_f16_K = !inkernel_dequant;
+            need_f16_V = !inkernel_dequant;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;

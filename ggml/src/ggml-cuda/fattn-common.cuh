@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -39,7 +40,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t kv_dequant);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -82,6 +84,67 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     }
 
     return data;
+}
+
+// In-kernel dequantization of quantized K/V for the MMA FlashAttention path: the f16 conversion
+// of the full K/V tensors and the f16 scratch reservation are skipped, and the MMA kernel
+// dequantizes q8_0/q4_0 blocks straight into the shared-memory tile instead.
+// Gate: GGML_CUDA_FA_INKERNEL_DEQUANT (default on; =0 restores convert-then-read on this binary).
+static constexpr int32_t GGML_CUDA_FATTN_KV_DEQUANT_OFF  = 0;
+static constexpr int32_t GGML_CUDA_FATTN_KV_DEQUANT_Q8_0 = 1;
+static constexpr int32_t GGML_CUDA_FATTN_KV_DEQUANT_Q4_0 = 2;
+
+static inline bool ggml_cuda_fattn_inkernel_dequant_enabled() {
+    static const bool enabled = []() {
+        const char * val = std::getenv("GGML_CUDA_FA_INKERNEL_DEQUANT");
+        return val == nullptr || std::atoi(val) != 0;
+    }();
+    return enabled;
+}
+
+// Shapes handled by flash_attn_ext_load_tile_quant (absorbed MLA: V shares K's quantized data).
+// Shared by the host-side predicate and the kernel-side guard in flash_attn_ext_f16 so that the
+// f16 scratch reservation (get_alloc_size) and the launch (mma_f16_case) always agree.
+static constexpr __host__ __device__ bool ggml_cuda_fattn_kv_dequant_shape(const int DKQ, const int DV) {
+    return (DKQ == 576 && DV == 512) || (DKQ == 512 && DV == 512);
+}
+
+// Single predicate used by BOTH ggml_cuda_flash_attn_ext_get_alloc_size (skip the f16 K/V scratch)
+// and ggml_cuda_flash_attn_ext_mma_f16_case (skip to_fp16 and pass the code to the kernel).
+static inline int32_t ggml_cuda_fattn_kv_dequant_code(const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (!ggml_cuda_fattn_inkernel_dequant_enabled()) {
+        return GGML_CUDA_FATTN_KV_DEQUANT_OFF;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (Q == nullptr || K == nullptr || V == nullptr || K->type != V->type || K->ne[0] != Q->ne[0]) {
+        return GGML_CUDA_FATTN_KV_DEQUANT_OFF;
+    }
+
+    // Same expression as ggml_cuda_flash_attn_ext_get_f16_extra_data / launch_fattn: in MLA V is a
+    // view of K and shares its quantized data. V->data == K->data mirrors launch_fattn's
+    // V_data = K_data for views, so the in-kernel path reads exactly what the convert path would.
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    if (!V_is_K_view || V->data != K->data) {
+        return GGML_CUDA_FATTN_KV_DEQUANT_OFF;
+    }
+
+    if (!ggml_cuda_fattn_kv_dequant_shape((int) Q->ne[0], (int) V->ne[0])) {
+        return GGML_CUDA_FATTN_KV_DEQUANT_OFF;
+    }
+
+    if (K->type == GGML_TYPE_Q8_0) {
+        return GGML_CUDA_FATTN_KV_DEQUANT_Q8_0;
+    }
+    if (K->type == GGML_TYPE_Q4_0) {
+        return GGML_CUDA_FATTN_KV_DEQUANT_Q4_0;
+    }
+    return GGML_CUDA_FATTN_KV_DEQUANT_OFF;
 }
 
 template <int D, int nthreads>
@@ -976,9 +1039,14 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const int32_t kv_dequant = GGML_CUDA_FATTN_KV_DEQUANT_OFF
 ) {
     constexpr int ncols = ncols1 * ncols2;
+
+    if (kv_dequant != GGML_CUDA_FATTN_KV_DEQUANT_OFF) {
+        // alloc/launch agreement: the caller must have skipped the f16 conversion for the same predicate.
+        GGML_ASSERT(!need_f16_K && !need_f16_V);
+    }
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -1245,7 +1313,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        kv_dequant
     );
     CUDA_CHECK(cudaGetLastError());
 

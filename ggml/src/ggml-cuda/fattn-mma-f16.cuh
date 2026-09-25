@@ -6,6 +6,8 @@
 
 using namespace ggml_cuda_mma;
 
+void ggml_cuda_fattn_log_inkernel_dequant_once(const int32_t code);
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -563,6 +565,102 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+// Dequantize a quantized (q8_0/q4_0) K/V slice straight into the f16 MMA tile.
+// One q8_0/q4_0 block is 32 values (16 half2). The absorbed MLA shapes handled by this loader
+// (see ggml_cuda_fattn_kv_dequant_shape) only ever load block-aligned chunks (static_asserts in
+// flash_attn_ext_f16_iter), so this replaces the full-tensor f16 conversion: raw rows are read
+// with LDG at the quant block the chunk starts at, dequantized with the exact to_fp16 math, and
+// stored to the (swizzled) shared-memory tile like flash_attn_ext_f16_load_tile would.
+// cp.async is not used on purpose: 576-elem q8_0/q4_0 rows are 612/324 bytes, both == 4 (mod 16),
+// so 16-byte cp.async cannot address row/chunk starts; 4-byte staging would need ~20 KB of extra
+// shared memory per block.
+template<int stride_tile, bool swz, int nwarps, int nbatch_fa, bool oob_check, bool use_sparse>
+static __device__ __forceinline__ void flash_attn_ext_load_tile_quant(
+        const int32_t kv_dequant,
+        const char * const __restrict__ KV,
+        half2 * const __restrict__ tile_KV,
+        const int D2,
+        const int stride_row,
+        const int k0_h2,
+        const int k_VKQ_0,
+        const int i_sup,
+        const int32_t * const __restrict__ indices) {
+    constexpr int warp_size    = ggml_cuda_get_physical_warp_size();
+    constexpr int h2_per_block = QK8_0/2; // 32 elements per q8_0/q4_0 block == 16 half2
+    const int nblocks = D2 / h2_per_block;
+    const int block0  = k0_h2 / h2_per_block;
+    const int nthreads = nwarps * warp_size;
+
+    static_assert(QK8_0 == QK4_0, "q8_0 and q4_0 block sizes must match");
+
+    for (int idx = threadIdx.y * warp_size + threadIdx.x; idx < nbatch_fa * nblocks; idx += nthreads) {
+        const int row   = idx / nblocks;
+        const int blk_i = idx - row * nblocks;
+
+        int64_t kv_row = (int64_t) k_VKQ_0 + row;
+        bool valid = true;
+        if constexpr (use_sparse) {
+            const int32_t index = row < i_sup ? indices[k_VKQ_0 + row] : -1;
+            valid  = index >= 0;
+            kv_row = valid ? index : 0;
+        } else if constexpr (oob_check) {
+            valid = row < i_sup;
+        }
+
+        half2 vals[h2_per_block];
+        if (!valid) {
+#pragma unroll
+            for (int t = 0; t < h2_per_block; ++t) {
+                vals[t] = __floats2half2_rn(0.0f, 0.0f);
+            }
+        } else {
+            const bool  is_q8_0     = kv_dequant == GGML_CUDA_FATTN_KV_DEQUANT_Q8_0;
+            const int   block_bytes = is_q8_0 ? (int) sizeof(block_q8_0) : (int) sizeof(block_q4_0);
+            const char * block_ptr  = KV + kv_row * (int64_t) stride_row + (int64_t) (block0 + blk_i) * block_bytes;
+
+            if (is_q8_0) {
+                const block_q8_0 * x = (const block_q8_0 *) block_ptr;
+                const float d = __half2float(x->d);
+#pragma unroll
+                for (int j = 0; j < QK8_0; j += 2) {
+                    // matches dequantize_block_q8_0_f16: __hmul2(make_half2(qs), d); the fp32
+                    // product d * (float) qs is exact (11-bit d, 8-bit qs), so the two round
+                    // identically to fp16.
+                    vals[j / 2] = __floats2half2_rn(d * (float) x->qs[j], d * (float) x->qs[j + 1]);
+                }
+            } else {
+                const block_q4_0 * x = (const block_q4_0 *) block_ptr;
+                const float d  = __half2float(x->d);
+                const float dm = -8.0f * d;
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    // matches dequantize_block_q4_0<half>: elems 0-15 take low nibbles,
+                    // elems 16-31 high nibbles; all intermediates are exact in fp32.
+                    const uint8_t b0 = x->qs[2*m];
+                    const uint8_t b1 = x->qs[2*m + 1];
+                    vals[m]     = __floats2half2_rn(d * (float) (b0 & 0xF) + dm, d * (float) (b1 & 0xF) + dm);
+                    vals[m + 8] = __floats2half2_rn(d * (float) (b0 >>   4) + dm, d * (float) (b1 >>   4) + dm);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int col_h2 = blk_i * h2_per_block + c * 4;
+            half2 * dst;
+            if constexpr (swz) {
+                dst = (half2 *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row, col_h2));
+            } else {
+                dst = tile_KV + row * stride_tile + col_h2;
+            }
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                dst[t] = vals[c * 4 + t];
+            }
+        }
+    }
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool use_sparse, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
@@ -592,8 +690,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_rowsum,
         const int jt,
         const int kb0,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        const int32_t kv_dequant) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    if constexpr (!ggml_cuda_fattn_kv_dequant_shape(DKQ, DV)) {
+        GGML_UNUSED(kv_dequant);
+    }
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -604,6 +706,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages  (DKQ, DV, ncols1, ncols2, use_sparse);
+
+    if constexpr (ggml_cuda_fattn_kv_dequant_shape(DKQ, DV)) {
+        // The quantized loader dequantizes 32-element (16 half2) blocks: every chunk boundary
+        // (nbatch_K2 / 2*nbatch_V2 steps from 0, plus the DKQ/2 and DV ends) must land on a
+        // quant block boundary, and the multi-stage pipeline (which reuses the f16 loader) is
+        // not implemented for the dequant path.
+        static_assert(nstages <= 1, "in-kernel K/V dequant is not implemented for multi-stage loading");
+        static_assert(nbatch_K2 % 16 == 0 && (DKQ/2) % 16 == 0, "K chunks must cover whole quant blocks");
+        static_assert(nbatch_V2 % 16 == 0 && DV % 16 == 0, "V chunks must cover whole quant blocks");
+    }
 
     // swizzle the tile stride for K and V based on the batch size.
     constexpr int stride_tile_K = ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_K2);
@@ -647,10 +759,25 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
-            if (use_cp_async) {
-                cp_async_wait_all();
+            if constexpr (ggml_cuda_fattn_kv_dequant_shape(DKQ, DV)) {
+                if (kv_dequant) {
+                    flash_attn_ext_load_tile_quant<stride_tile_K, swz_K, nwarps, nbatch_fa, oob_check, use_sparse>
+                        (kv_dequant, (const char *) K_h2, tile_K, k0_diff, stride_K, k0_start, k_VKQ_0, k_VKQ_sup, indices);
+                } else {
+                    flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                        (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+                }
+                if constexpr (use_cp_async) {
+                    // Also drains the mask cp.async issued above: the quantized load does not
+                    // issue any cp.async itself, but __syncthreads does not order cp.async.
+                    cp_async_wait_all();
+                }
+            } else {
+                flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+                if (use_cp_async) {
+                    cp_async_wait_all();
+                }
             }
             __syncthreads();
         }
@@ -1000,10 +1127,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
-                if (use_cp_async) {
-                    cp_async_wait_all();
+                if constexpr (ggml_cuda_fattn_kv_dequant_shape(DKQ, DV)) {
+                    if (kv_dequant) {
+                        flash_attn_ext_load_tile_quant<stride_tile_V, swz_V, nwarps, nbatch_fa, oob_check, use_sparse>
+                            (kv_dequant, (const char *) V_h2, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_0, k_VKQ_sup, indices);
+                    } else {
+                        flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                            (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                    }
+                    if constexpr (use_cp_async) {
+                        cp_async_wait_all();
+                    }
+                } else {
+                    flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                        (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                    if (use_cp_async) {
+                        cp_async_wait_all();
+                    }
                 }
                 __syncthreads();
             }
@@ -1060,7 +1200,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask,
-        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
+        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, kv_dequant);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1179,7 +1319,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int jt,
         const int zt_gqa,
         const int kb0_start,
-        const int kb0_stop) {
+        const int kb0_stop,
+        const int32_t kv_dequant) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1327,7 +1468,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kv_dequant);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1336,7 +1477,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kv_dequant);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -1347,7 +1488,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                 (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kv_dequant);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1356,7 +1497,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
             (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+             KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kv_dequant);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
@@ -1752,7 +1893,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
-        jt, kb0_start, kb0_stop);
+        jt, kb0_start, kb0_stop, kv_dequant);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -1786,7 +1927,8 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+                            const int32_t kv_dequant_arg) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
@@ -1798,6 +1940,7 @@ static __global__ void flash_attn_ext_f16(
     const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
+    const int32_t kv_dequant = ggml_cuda_fattn_kv_dequant_shape(DKQ, DV) ? kv_dequant_arg : 0;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -1851,10 +1994,11 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    const int stride_K    = nb11 / sizeof(half2);
+    // q8_0/q4_0 rows are not half2-strided; the in-kernel dequant reads byte strides.
+    const int stride_K    = kv_dequant ? nb11 : nb11 / (int) sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
+    const int stride_V = V_is_K_view ? stride_K : (kv_dequant ? nb21 : nb21 / (int) sizeof(half2));
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
@@ -1901,12 +2045,12 @@ static __global__ void flash_attn_ext_f16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, kv_dequant);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, kv_dequant);
         }
 
         kbc += iter_k;
@@ -1948,7 +2092,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, kv_dequant);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -1958,7 +2102,7 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, kv_dequant_arg);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
@@ -2064,8 +2208,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    // Single shared predicate (same as get_alloc_size): skip to_fp16 + pass the dequant code.
+    const int32_t kv_dequant = ggml_cuda_fattn_kv_dequant_code(dst);
+    ggml_cuda_fattn_log_inkernel_dequant_once(kv_dequant);
+
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
+         kv_dequant == GGML_CUDA_FATTN_KV_DEQUANT_OFF, kv_dequant == GGML_CUDA_FATTN_KV_DEQUANT_OFF,
+         true, use_sparse, warp_size_host, kv_dequant);
 }
 
 

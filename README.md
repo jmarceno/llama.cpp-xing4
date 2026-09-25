@@ -1,3 +1,25 @@
+# Xing4.0 speed fork
+
+This repository is [`shuxiaoqiong/llama.cpp`](https://github.com/shuxiaoqiong/llama.cpp) branch [`xing4_0-port`](https://github.com/shuxiaoqiong/llama.cpp/tree/xing4_0-port) — the engine behind [ggml-org/llama.cpp#29012](https://github.com/ggml-org/llama.cpp/pull/29012), which adds the `xing4_0` architecture (mHC, absorbed MLA, 64-expert MoE, MTP block) — plus two CUDA changes so [Xing4.0-29B-A4B](https://huggingface.co/XingChen-AGI/Xing4.0-29B-A4B) decodes faster when the KV cache is quantized.
+
+Serve the dynamic GGUF from [jmarceno/Xing4.0-29B-A4B-GGUF](https://huggingface.co/jmarceno/Xing4.0-29B-A4B-GGUF) with **this** tree. The stock `xing4_0-port` binary loads the same file, and on every FlashAttention step it converts the whole KV cache to f16 first.
+
+**Branch:** `xing4_0-port` (default on this fork). License remains MIT. Base-model weights stay under the China Telecom / TeleAI Apache-2.0 license.
+
+## What changed
+
+Xing4.0 attention is absorbed MLA. With `-ctk q8_0 -ctv q8_0`, K is 576 and V is 512, and V is a view of K. The Ampere MMA FlashAttention configs for that shape are single-stage, so the vendor kernel converts the full KV cache to f16 before the matmul and the graph reserves that scratch for the whole context.
+
+1. **In-kernel q8_0 / q4_0 dequant** (`ggml/src/ggml-cuda/fattn.cu`, `fattn-common.cuh`, `fattn-mma-f16.cuh`, and the tile/vec kernel signatures). For head shapes 576/512 and 512/512, when V is a view of quantized K, the MMA kernel dequantizes K/V blocks straight into the shared-memory tile. The f16 conversion and its scratch reservation are skipped. This is on by default; `GGML_CUDA_FA_INKERNEL_DEQUANT=0` restores convert-then-read. A 2048-token greedy smoke on the published dynamic quant matched the previous binary (same completion, `11, 13, and 17`, on the same prime-number prompt). The cost that disappears grows with context length.
+
+2. **Top-k MoE fusion stays valid under the CUDA graph allocator** (`ggml/src/ggml-cuda/ggml-cuda.cu`), the same allocator edges as upstream [llama.cpp#28432](https://github.com/ggml-org/llama.cpp/pull/28432). Without them the allocator can reuse a fusion input as an output, and `ggml_cuda_check_fusion_memory_ranges` rejects a valid 64-expert top-k fusion. Xing4.0 routes 64 experts, top-4.
+
+Build this branch with CUDA and point `llama-server` at the GGUF. Flags used with the published quant: context 131072, `-ctk q8_0 -ctv q8_0`, Flash Attention on, all layers on GPU. `GGML_CUDA_DISABLE_FUSION=1` turns the MoE fusion path off.
+
+The rest of this file is the upstream llama.cpp README.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

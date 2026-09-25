@@ -4515,24 +4515,89 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+
+    // Keep fusion inputs alive until the fused output is allocated. Without these
+    // edges the allocator reuses a source buffer for an output and
+    // ggml_cuda_check_fusion_memory_ranges rejects a valid top-k MoE fusion
+    // (upstream llama.cpp PR #28432).
+    auto add_alloc_deps = [&](size_t start, size_t last_node) {
+        for (size_t i = start; i < last_node; ++i) {
+            params->add_alloc_dep(params->user_data, cgraph->nodes[i], cgraph->nodes[last_node]);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (cgraph->nodes[i]->src[j]) {
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[j], cgraph->nodes[last_node]);
+                }
+            }
+        }
+    };
+
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (cgraph->nodes[i]->op != GGML_OP_MUL) {
-                continue;
-            }
-
             ggml_cuda_moe_weighted_reduction_match match;
-            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+                if (match.expert_scale != nullptr) {
+                    params->add_alloc_dep(
+                        params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                }
+                i += match.node_count - 1;
                 continue;
             }
 
-            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
-            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
-            if (match.expert_scale != nullptr) {
-                params->add_alloc_dep(
-                    params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+            if (cgraph->nodes[i]->op != GGML_OP_UNARY && cgraph->nodes[i]->op != GGML_OP_SOFT_MAX &&
+                    cgraph->nodes[i]->op != GGML_OP_ARGSORT) {
+                continue;
             }
-            i += match.node_count - 1;
+
+            ggml_cuda_topk_moe_args args;
+            if (!ggml_cuda_topk_moe_fusion(cgraph, i, args) || args.delayed_softmax) {
+                continue;
+            }
+
+            const ggml_tensor * node = cgraph->nodes[i];
+            std::vector<ggml_op> ops;
+            int out_nodes[2];
+            if (args.sigmoid) {
+                ops.insert(ops.end(), { GGML_OP_UNARY });
+            } else if (args.sqrt_softplus) {
+                ops.insert(ops.end(), { GGML_OP_UNARY, GGML_OP_SQRT });
+            } else {
+                ops.insert(ops.end(), { GGML_OP_SOFT_MAX });
+            }
+            const int i_probs = i + (int) ops.size() - 1;
+            if (args.prob_bias) {
+                ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                out_nodes[0] = i_probs + 4;
+            } else {
+                ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+                out_nodes[0] = i_probs + 3;
+            }
+            if (args.norm) {
+                ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+            }
+            if (args.scale) {
+                ops.insert(ops.end(), { GGML_OP_SCALE });
+            }
+            const int fused_end = i + (int) ops.size();
+            out_nodes[1] = fused_end - 1;
+            if (fused_end > cgraph->n_nodes || out_nodes[0] >= cgraph->n_nodes || out_nodes[1] < i) {
+                continue;
+            }
+            ggml_tensor * weights = cgraph->nodes[out_nodes[1]];
+            ggml_tensor * ids     = cgraph->nodes[out_nodes[0]];
+            if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
+                    ggml_cuda_should_use_topk_moe(node, node->src[0], weights, ids)) {
+                if (fused_end < cgraph->n_nodes) {
+                    add_alloc_deps((size_t) i, (size_t) fused_end);
+                } else {
+                    add_alloc_deps((size_t) i, (size_t) out_nodes[1]);
+                    if (out_nodes[0] != out_nodes[1]) {
+                        add_alloc_deps((size_t) i, (size_t) out_nodes[0]);
+                    }
+                }
+                i += (int) ops.size() - 1;
+            }
         }
     }
 
